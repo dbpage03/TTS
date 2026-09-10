@@ -1,0 +1,10 @@
+# Qwen3-TTS quick test CLI dependencies
+#
+# qwen-tts pulls in torch, transformers, soundfile, librosa, etc.
+qwen-tts
+
+# Audio playback to the system speakers (bundles PortAudio wheels for Windows).
+sounddevice
+
+# WAV writing (also a transitive dependency of qwen-tts, listed for clarity).
+soundfile
