@@ -1,0 +1,498 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Qwen3 TTS Studio</title>
+<link rel="icon" href="/favicon.ico" type="image/svg+xml">
+<style>
+  :root {
+    --bg: #f6f6fb; --panel: #ffffff; --panel-2: #f1f0f8; --border: #e3e1ef;
+    --text: #1c1b29; --muted: #6b6984; --accent: #6d5dfc; --accent-2: #9b6dff;
+    --accent-soft: #ece9ff; --danger: #e5484d; --ok: #2fb67c; --warn: #e8a317;
+    --shadow: 0 1px 2px rgba(20,16,60,.05), 0 8px 24px rgba(20,16,60,.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f0f17; --panel: #171723; --panel-2: #1f1e2e; --border: #2b2a3d;
+      --text: #ecebf5; --muted: #9592ad; --accent: #8b7dff; --accent-2: #b48cff;
+      --accent-soft: #26224a; --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.25);
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font: 15px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between; gap: 16px;
+    padding: 18px 28px; border-bottom: 1px solid var(--border); background: var(--panel);
+    position: sticky; top: 0; z-index: 5;
+  }
+  .brand { display: flex; align-items: center; gap: 12px; font-weight: 700; font-size: 18px; }
+  .logo {
+    width: 34px; height: 34px; border-radius: 10px; display: grid; place-items: center;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #fff;
+  }
+  .brand small { display: block; font-weight: 500; font-size: 12px; color: var(--muted); }
+  .pill {
+    display: inline-flex; align-items: center; gap: 8px; padding: 6px 12px; border-radius: 999px;
+    background: var(--panel-2); border: 1px solid var(--border); font-size: 13px; color: var(--muted);
+    max-width: 60vw; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--warn); flex: none; }
+  .dot.ready { background: var(--ok); }
+  .dot.error { background: var(--danger); }
+  .dot.loading, .dot.busy { animation: pulse 1.2s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .3; } }
+
+  main {
+    max-width: 1240px; margin: 0 auto; padding: 24px 28px 48px;
+    display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 24px;
+  }
+  @media (max-width: 960px) { main { grid-template-columns: 1fr; padding: 16px; } header { padding: 14px 16px; } }
+
+  .card { background: var(--panel); border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow); }
+  .card + .card { margin-top: 24px; }
+  .card-head { padding: 16px 20px 0; display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+  .card-head h2 { margin: 0; font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); font-weight: 650; }
+  .card-body { padding: 14px 20px 20px; }
+
+  textarea, input[type=text], select {
+    width: 100%; font: inherit; color: var(--text); background: var(--panel-2);
+    border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; outline: none;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  textarea { min-height: 180px; resize: vertical; font-size: 16px; line-height: 1.6; }
+  textarea:focus, input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+  .meta-row { display: flex; justify-content: space-between; color: var(--muted); font-size: 12px; margin-top: 8px; }
+
+  .speakers { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 10px; }
+  .spk {
+    text-align: left; cursor: pointer; padding: 12px 14px; border-radius: 12px;
+    border: 1px solid var(--border); background: var(--panel-2); color: var(--text); font: inherit;
+    transition: border-color .15s, background .15s, transform .05s;
+  }
+  .spk:hover { border-color: var(--accent); }
+  .spk:active { transform: scale(.99); }
+  .spk.active { border-color: var(--accent); background: var(--accent-soft); box-shadow: 0 0 0 1px var(--accent) inset; }
+  .spk b { display: flex; justify-content: space-between; align-items: center; font-size: 14px; }
+  .spk .tag { font-size: 11px; font-weight: 600; color: var(--accent); background: var(--panel); border-radius: 6px; padding: 1px 6px; }
+  .spk p { margin: 4px 0 0; font-size: 12px; color: var(--muted); line-height: 1.4; }
+
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+  @media (max-width: 600px) { .grid2 { grid-template-columns: 1fr; } }
+  label.lbl { display: block; font-size: 12px; font-weight: 600; color: var(--muted); margin-bottom: 6px; }
+  .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .chip {
+    font: inherit; font-size: 12px; padding: 4px 10px; border-radius: 999px; cursor: pointer;
+    border: 1px solid var(--border); background: var(--panel); color: var(--muted);
+  }
+  .chip:hover { color: var(--accent); border-color: var(--accent); }
+  details { margin-top: 14px; }
+  summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+  .range-row { display: flex; align-items: center; gap: 12px; margin-top: 10px; }
+  .range-row input[type=range] { flex: 1; accent-color: var(--accent); }
+  .adv-grid { display: grid; grid-template-columns: 190px 1fr 64px; gap: 10px 12px; align-items: center; margin-top: 12px; }
+  .adv-grid .lbl { margin: 0; }
+  .adv-grid input[type=range] { accent-color: var(--accent); width: 100%; }
+  .adv-grid .val { font-size: 12px; color: var(--muted); text-align: right; font-variant-numeric: tabular-nums; }
+  .adv-grid .sub { grid-column: 1 / -1; font-size: 12px; font-weight: 700; color: var(--text); margin-top: 6px; display: flex; align-items: center; }
+  @media (max-width: 600px) { .adv-grid { grid-template-columns: 1fr 56px; } .adv-grid .lbl { grid-column: 1 / -1; } }
+  .progress { height: 4px; background: var(--panel-2); border-radius: 4px; overflow: hidden; margin-top: 14px; display: none; }
+  .progress.on { display: block; }
+  .progress > div { height: 100%; width: 0; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width .3s; }
+  .progress.indet > div { width: 30%; animation: indet 1.2s ease-in-out infinite; }
+  @keyframes indet { from { transform: translateX(-100%); } to { transform: translateX(340%); } }
+  .check { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 14px; }
+  .check input { accent-color: var(--accent); width: 16px; height: 16px; }
+
+  .actions { display: flex; align-items: center; gap: 12px; margin-top: 18px; flex-wrap: wrap; }
+  .btn {
+    font: inherit; font-weight: 650; border: 0; cursor: pointer; border-radius: 12px; padding: 12px 22px;
+    background: linear-gradient(135deg, var(--accent), var(--accent-2)); color: #fff;
+    display: inline-flex; align-items: center; gap: 10px; box-shadow: 0 6px 18px rgba(109,93,252,.3);
+  }
+  .btn:disabled { opacity: .5; cursor: not-allowed; box-shadow: none; }
+  .btn .spin { width: 16px; height: 16px; border: 2px solid rgba(255,255,255,.4); border-top-color: #fff; border-radius: 50%; animation: spin .8s linear infinite; display: none; }
+  .btn.working .spin { display: inline-block; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .hint { color: var(--muted); font-size: 12px; }
+  kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--border); border-bottom-width: 2px; border-radius: 5px; padding: 1px 5px; background: var(--panel-2); }
+  .err { color: var(--danger); font-size: 13px; margin-top: 12px; white-space: pre-wrap; }
+
+  .player { padding: 16px 20px 20px; }
+  .player-empty { color: var(--muted); font-size: 14px; text-align: center; padding: 26px 8px; }
+  canvas.wave { width: 100%; height: 64px; display: block; border-radius: 10px; background: var(--panel-2); cursor: pointer; }
+  .player audio { width: 100%; margin-top: 10px; }
+  .player .now { font-size: 13px; color: var(--muted); margin-top: 8px; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+
+  .history { list-style: none; margin: 0; padding: 0 8px 8px; max-height: calc(100vh - 430px); min-height: 160px; overflow: auto; }
+  .history li {
+    padding: 10px 12px; border-radius: 12px; cursor: pointer; display: grid;
+    grid-template-columns: 32px 1fr auto; gap: 10px; align-items: center;
+  }
+  .history li:hover { background: var(--panel-2); }
+  .history li.playing { background: var(--accent-soft); }
+  .play-ic {
+    width: 32px; height: 32px; border-radius: 50%; display: grid; place-items: center;
+    background: var(--accent-soft); color: var(--accent); border: 0; cursor: pointer;
+  }
+  .h-text { font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .h-meta { font-size: 11px; color: var(--muted); }
+  .h-act { display: flex; gap: 2px; opacity: .55; }
+  .history li:hover .h-act { opacity: 1; }
+  .icon-btn { border: 0; background: none; color: var(--muted); cursor: pointer; padding: 6px; border-radius: 8px; display: grid; place-items: center; text-decoration: none; }
+  .icon-btn:hover { color: var(--text); background: var(--panel); }
+  .icon-btn.del:hover { color: var(--danger); }
+  .empty { color: var(--muted); text-align: center; font-size: 13px; padding: 24px; }
+  .toast {
+    position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%) translateY(80px);
+    background: var(--text); color: var(--bg); padding: 10px 16px; border-radius: 10px; font-size: 14px;
+    transition: transform .25s; z-index: 10;
+  }
+  .toast.show { transform: translateX(-50%) translateY(0); }
+</style>
+</head>
+<body>
+<header>
+  <div class="brand">
+    <div class="logo">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M4 10v4M8 7v10M12 4v16M16 8v8M20 11v2"/></svg>
+    </div>
+    <div>Qwen3 TTS Studio<small id="modelName">CustomVoice</small></div>
+  </div>
+  <div class="pill" id="statusPill"><span class="dot" id="statusDot"></span><span id="statusText">Connecting…</span></div>
+</header>
+
+<main>
+  <section>
+    <div class="card">
+      <div class="card-head"><h2>Text</h2></div>
+      <div class="card-body">
+        <textarea id="text" placeholder="Type something to say…" spellcheck="true"></textarea>
+        <div class="meta-row"><span id="charCount">0 characters</span><span><kbd>Ctrl</kbd> + <kbd>Enter</kbd> to generate</span></div>
+
+        <div class="grid2" style="margin-top:16px">
+          <div>
+            <label class="lbl" for="language">Language</label>
+            <select id="language"></select>
+          </div>
+          <div>
+            <label class="lbl" for="clipName">Clip name <span style="font-weight:400">(optional)</span></label>
+            <input type="text" id="clipName" placeholder="Defaults to the text">
+          </div>
+        </div>
+
+        <div style="margin-top:16px">
+          <label class="lbl" for="instruct">Style instruction <span style="font-weight:400">(optional)</span></label>
+          <input type="text" id="instruct" placeholder="e.g. Very happy and excited.">
+          <div class="chips" id="chips"></div>
+        </div>
+
+        <details id="adv">
+          <summary>Advanced</summary>
+          <div class="adv-grid">
+            <div class="sub">Speed</div>
+            <label class="lbl" for="chunkChars" title="Long text is split at sentence boundaries into chunks of about this many characters, which are generated in parallel. 0 = never split.">Chunk size (chars)</label>
+            <input type="range" id="chunkChars" min="0" max="1000" step="20"><span class="val" id="chunkCharsVal"></span>
+            <label class="lbl" for="batchSize" title="How many chunks to generate at once. Higher is faster but uses more VRAM.">Batch size</label>
+            <input type="range" id="batchSize" min="1" max="16" step="1"><span class="val" id="batchSizeVal"></span>
+            <label class="lbl" for="pauseMs" title="Silence inserted between chunks.">Pause between chunks (ms)</label>
+            <input type="range" id="pauseMs" min="0" max="1500" step="50"><span class="val" id="pauseMsVal"></span>
+            <label class="lbl" for="maxTokens">Max new tokens per chunk</label>
+            <input type="range" id="maxTokens" min="256" max="32768" step="256"><span class="val" id="maxTokensVal"></span>
+
+            <div class="sub">Sampling <button class="chip" id="resetSampling" type="button" style="margin-left:6px">Reset</button></div>
+            <label class="lbl" for="temperature" title="Higher = more expressive / random. Default is the model's own setting.">Temperature</label>
+            <input type="range" id="temperature" min="0" max="1.5" step="0.05"><span class="val" id="temperatureVal"></span>
+            <label class="lbl" for="topP">Top-p</label>
+            <input type="range" id="topP" min="0" max="1" step="0.05"><span class="val" id="topPVal"></span>
+            <label class="lbl" for="repPen">Repetition penalty</label>
+            <input type="range" id="repPen" min="0.95" max="1.5" step="0.01"><span class="val" id="repPenVal"></span>
+            <label class="lbl" for="seed" title="Fix the seed to reproduce the same take. Leave blank for random.">Seed</label>
+            <input type="text" id="seed" placeholder="random" inputmode="numeric" style="padding:6px 10px">
+            <button class="chip" id="dice" type="button" title="Random seed">🎲</button>
+          </div>
+          <label class="check"><input type="checkbox" id="playServer"> Also play on the server's speakers</label>
+        </details>
+
+        <div class="actions">
+          <button class="btn" id="genBtn" disabled><span class="spin"></span><span id="genLabel">Generate speech</span></button>
+          <span class="hint" id="genHint"></span>
+        </div>
+        <div class="progress" id="progress"><div id="progressBar"></div></div>
+        <div class="err" id="err"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head"><h2>Voice</h2><span class="hint" id="spkName"></span></div>
+      <div class="card-body"><div class="speakers" id="speakers"></div></div>
+    </div>
+  </section>
+
+  <aside>
+    <div class="card">
+      <div class="card-head"><h2>Player</h2></div>
+      <div class="player">
+        <div class="player-empty" id="playerEmpty">Generated audio will appear here.</div>
+        <div id="playerWrap" hidden>
+          <canvas class="wave" id="wave" width="680" height="128"></canvas>
+          <audio id="audio" controls></audio>
+          <div class="now" id="nowText"></div>
+        </div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-head"><h2>History</h2><span class="hint" id="histCount"></span></div>
+      <ul class="history" id="history"></ul>
+    </div>
+  </aside>
+</main>
+<div class="toast" id="toast"></div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const PRESETS = ["Very happy.", "Calm and soothing.", "Sad, almost crying.", "Angry and shouting.",
+                 "Whispering.", "Speak slowly.", "Speak fast and excited.", "Sarcastic."];
+const LS = {
+  get(k, d) { try { const v = localStorage.getItem("tts." + k); return v === null ? d : JSON.parse(v); } catch { return d; } },
+  set(k, v) { try { localStorage.setItem("tts." + k, JSON.stringify(v)); } catch {} },
+};
+
+let ready = false, generating = false, speaker = LS.get("speaker", "Vivian"), currentId = null;
+
+function toast(msg) {
+  const t = $("toast"); t.textContent = msg; t.classList.add("show");
+  clearTimeout(toast._t); toast._t = setTimeout(() => t.classList.remove("show"), 2200);
+}
+function esc(s) { return String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+function fmtDur(s) { s = Math.round(s || 0); return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`; }
+
+// ---------- status ----------
+async function pollStatus() {
+  try {
+    const s = await (await fetch("/api/status")).json();
+    const dot = $("statusDot"); dot.className = "dot " + (s.busy ? "busy" : s.status);
+    if (s.status === "warming") dot.className = "dot loading";
+    let txt = { idle: "Starting…", loading: "Loading model…", warming: "Warming up…", ready: "Ready", error: "Model failed to load" }[s.status] || s.status;
+    if (s.status === "ready") txt = `${s.busy ? "Generating…" : "Ready"} · ${s.device} · ${s.dtype}`;
+    if (s.status === "error") { txt += ": " + s.error; $("err").textContent = s.error; }
+    $("statusText").textContent = txt; $("statusPill").title = txt;
+    if (s.model) $("modelName").textContent = s.model;
+    ready = s.status === "ready";
+    updateBtn();
+    setTimeout(pollStatus, ready ? 4000 : 1000);
+  } catch {
+    $("statusDot").className = "dot error"; $("statusText").textContent = "Server unreachable";
+    ready = false; updateBtn(); setTimeout(pollStatus, 2000);
+  }
+}
+function updateBtn() {
+  const hasText = $("text").value.trim().length > 0;
+  $("genBtn").disabled = !ready || generating || !hasText;
+  $("genHint").textContent = !ready ? "Waiting for the model to load…" : (!hasText && !generating ? "Enter some text to begin." : "");
+}
+
+// ---------- options ----------
+async function loadOptions() {
+  const o = await (await fetch("/api/options")).json();
+  const sel = $("language");
+  sel.innerHTML = o.languages.map(l => `<option>${esc(l)}</option>`).join("");
+  sel.value = LS.get("language", "Auto");
+  if (!o.speakers.some(s => s.name === speaker)) speaker = o.speakers[0].name;
+  $("speakers").innerHTML = o.speakers.map(s => {
+    const m = s.description.match(/^(.*)\s*\(([^)]+)\)\s*$/);
+    const desc = m ? m[1] : s.description, lang = m ? m[2] : "";
+    return `<button class="spk" data-name="${esc(s.name)}"><b>${esc(s.name.replace("_", " "))}<span class="tag">${esc(lang)}</span></b><p>${esc(desc)}</p></button>`;
+  }).join("");
+  $("speakers").addEventListener("click", e => {
+    const b = e.target.closest(".spk"); if (!b) return;
+    speaker = b.dataset.name; LS.set("speaker", speaker); markSpeaker();
+  });
+  markSpeaker();
+}
+function markSpeaker() {
+  document.querySelectorAll(".spk").forEach(b => b.classList.toggle("active", b.dataset.name === speaker));
+  $("spkName").textContent = speaker.replace("_", " ");
+}
+
+// ---------- generate ----------
+async function generate() {
+  if ($("genBtn").disabled) return;
+  generating = true; updateBtn();
+  $("genBtn").classList.add("working"); $("genLabel").textContent = "Generating…"; $("err").textContent = "";
+  const t0 = performance.now();
+  const bar = $("progress"); bar.className = "progress on indet"; $("progressBar").style.width = "";
+  let prog = { done: 0, total: 0 };
+  const tick = setInterval(async () => {
+    const secs = ((performance.now() - t0) / 1000).toFixed(0);
+    $("genHint").textContent = prog.total > 1 ? `Chunk ${prog.done}/${prog.total} · ${secs}s` : `${secs}s elapsed`;
+    try {
+      prog = (await (await fetch("/api/status")).json()).progress || prog;
+      if (prog.total > 1) { bar.className = "progress on"; $("progressBar").style.width = `${Math.max(4, 100 * prog.done / prog.total)}%`; }
+    } catch {}
+  }, 700);
+  try {
+    const res = await fetch("/api/synthesize", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        text: $("text").value, speaker, language: $("language").value,
+        instruct: $("instruct").value || null, name: $("clipName").value || null,
+        play_on_server: $("playServer").checked, ...samplingParams(),
+      }),
+    });
+    const data = await res.json();
+    if (!res.ok) throw new Error(data.detail ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)) : res.statusText);
+    toast(`Generated ${data.duration}s of audio in ${data.synth_seconds}s`);
+    await loadHistory();
+    play(data, true);
+  } catch (e) {
+    $("err").textContent = "Error: " + e.message;
+  } finally {
+    clearInterval(tick); generating = false; bar.className = "progress";
+    $("genBtn").classList.remove("working"); $("genLabel").textContent = "Generate speech"; updateBtn();
+  }
+}
+
+// ---------- player ----------
+let peaks = null;
+async function play(clip, autoplay) {
+  currentId = clip.id;
+  $("playerEmpty").hidden = true; $("playerWrap").hidden = false;
+  const a = $("audio"); a.src = clip.url;
+  $("nowText").textContent = `${clip.speaker || ""}${clip.instruct ? " · " + clip.instruct : ""} — ${clip.text || clip.id}`;
+  document.querySelectorAll(".history li").forEach(li => li.classList.toggle("playing", li.dataset.id === clip.id));
+  if (autoplay) a.play().catch(() => {});
+  peaks = null; drawWave();
+  try {
+    const buf = await (await fetch(clip.url)).arrayBuffer();
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    const audio = await ctx.decodeAudioData(buf); ctx.close();
+    const data = audio.getChannelData(0), n = 170, step = Math.floor(data.length / n) || 1;
+    peaks = Array.from({ length: n }, (_, i) => {
+      let m = 0; for (let j = i * step; j < Math.min((i + 1) * step, data.length); j++) m = Math.max(m, Math.abs(data[j]));
+      return m;
+    });
+    const max = Math.max(...peaks, 0.01); peaks = peaks.map(p => p / max);
+    if (currentId === clip.id) drawWave();
+  } catch {}
+}
+function drawWave() {
+  const c = $("wave"), g = c.getContext("2d"), cs = getComputedStyle(document.documentElement);
+  const W = c.width, H = c.height, a = $("audio");
+  g.clearRect(0, 0, W, H);
+  if (!peaks) return;
+  const prog = a.duration ? a.currentTime / a.duration : 0, bw = W / peaks.length;
+  peaks.forEach((p, i) => {
+    const h = Math.max(3, p * (H - 16));
+    g.fillStyle = (i / peaks.length) < prog ? cs.getPropertyValue("--accent") : cs.getPropertyValue("--border");
+    g.beginPath(); g.roundRect(i * bw + 1, (H - h) / 2, Math.max(1, bw - 2), h, 2); g.fill();
+  });
+}
+$("audio").addEventListener("timeupdate", drawWave);
+$("audio").addEventListener("seeked", drawWave);
+$("wave").addEventListener("click", e => {
+  const a = $("audio"), r = e.target.getBoundingClientRect();
+  if (a.duration) { a.currentTime = ((e.clientX - r.left) / r.width) * a.duration; a.play(); }
+});
+(function loop() { if (!$("audio").paused) drawWave(); requestAnimationFrame(loop); })();
+
+// ---------- history ----------
+let clips = [];
+async function loadHistory() {
+  clips = await (await fetch("/api/clips")).json();
+  $("histCount").textContent = clips.length ? `${clips.length} clip${clips.length > 1 ? "s" : ""}` : "";
+  $("history").innerHTML = clips.length ? clips.map(c => `
+    <li data-id="${esc(c.id)}" class="${c.id === currentId ? "playing" : ""}">
+      <button class="play-ic" title="Play"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor"><path d="M7 4v16l13-8z"/></svg></button>
+      <div style="min-width:0">
+        <div class="h-text" title="${esc(c.text)}">${esc(c.text || c.id)}</div>
+        <div class="h-meta">${esc((c.speaker || "").replace("_", " "))}${c.duration ? " · " + fmtDur(c.duration) : ""}${c.created ? " · " + esc(new Date(c.created).toLocaleString([], {month:"short", day:"numeric", hour:"numeric", minute:"2-digit"})) : ""}</div>
+      </div>
+      <div class="h-act">
+        <button class="icon-btn reuse" title="Reuse settings"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/></svg></button>
+        <a class="icon-btn" title="Download" href="${esc(c.url)}?download=true"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3v12m0 0-4-4m4 4 4-4M5 21h14"/></svg></a>
+        <button class="icon-btn del" title="Delete"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg></button>
+      </div>
+    </li>`).join("") : `<div class="empty">No clips yet.</div>`;
+}
+$("history").addEventListener("click", async e => {
+  const li = e.target.closest("li"); if (!li) return;
+  const clip = clips.find(c => c.id === li.dataset.id); if (!clip) return;
+  if (e.target.closest("a")) return;
+  if (e.target.closest(".del")) {
+    if (!confirm("Delete this clip?")) return;
+    await fetch(`/api/clips/${encodeURIComponent(clip.id)}`, { method: "DELETE" });
+    if (currentId === clip.id) { $("audio").pause(); $("audio").removeAttribute("src"); $("playerWrap").hidden = true; $("playerEmpty").hidden = false; currentId = null; }
+    loadHistory(); return;
+  }
+  if (e.target.closest(".reuse")) {
+    if (clip.text) $("text").value = clip.text;
+    if (clip.speaker) { speaker = clip.speaker; markSpeaker(); }
+    if (clip.language) $("language").value = clip.language;
+    $("instruct").value = clip.instruct || "";
+    if (clip.seed != null) { $("seed").value = clip.seed; LS.set("seed", String(clip.seed)); }
+    onText(); toast("Settings loaded"); return;
+  }
+  play(clip, true);
+});
+
+// ---------- inputs ----------
+function onText() {
+  const n = $("text").value.length; $("charCount").textContent = `${n} character${n === 1 ? "" : "s"}`;
+  LS.set("text", $("text").value); updateBtn();
+}
+$("text").addEventListener("input", onText);
+$("text").value = LS.get("text", "");
+$("instruct").value = LS.get("instruct", "");
+$("instruct").addEventListener("input", () => LS.set("instruct", $("instruct").value));
+$("language").addEventListener("change", () => LS.set("language", $("language").value));
+// Advanced sliders: [id, default, formatter]. Sampling sliders at their lowest
+// position mean "use the model's default" and are sent as null.
+const SLIDERS = [
+  ["chunkChars", 220, v => v == 0 ? "off" : v],
+  ["batchSize", 4, v => v],
+  ["pauseMs", 200, v => v],
+  ["maxTokens", 4096, v => v],
+  ["temperature", 0, v => v == 0 ? "default" : (+v).toFixed(2)],
+  ["topP", 0, v => v == 0 ? "default" : (+v).toFixed(2)],
+  ["repPen", 0.95, v => v < 1 ? "default" : (+v).toFixed(2)],
+];
+for (const [id, def, fmt] of SLIDERS) {
+  const el = $(id), out = $(id + "Val");
+  el.value = LS.get(id, def);
+  const sync = () => { out.textContent = fmt(el.value); LS.set(id, +el.value); };
+  el.addEventListener("input", sync); sync();
+}
+$("resetSampling").addEventListener("click", () => {
+  for (const [id, def] of SLIDERS.slice(4)) { $(id).value = def; $(id).dispatchEvent(new Event("input")); }
+  $("seed").value = ""; LS.set("seed", "");
+});
+$("seed").value = LS.get("seed", "");
+$("seed").addEventListener("input", () => { $("seed").value = $("seed").value.replace(/\D/g, ""); LS.set("seed", $("seed").value); });
+$("dice").addEventListener("click", () => { $("seed").value = Math.floor(Math.random() * 1e9); LS.set("seed", $("seed").value); });
+$("adv").open = LS.get("advOpen", false);
+$("adv").addEventListener("toggle", () => LS.set("advOpen", $("adv").open));
+function samplingParams() {
+  const t = +$("temperature").value, p = +$("topP").value, r = +$("repPen").value, s = $("seed").value;
+  return {
+    chunk_chars: +$("chunkChars").value, batch_size: +$("batchSize").value, pause_ms: +$("pauseMs").value,
+    max_new_tokens: +$("maxTokens").value,
+    temperature: t > 0 ? t : null, top_p: p > 0 ? p : null, repetition_penalty: r >= 1 ? r : null,
+    seed: s === "" ? null : +s,
+  };
+}
+$("chips").innerHTML = PRESETS.map(p => `<button class="chip">${esc(p)}</button>`).join("");
+$("chips").addEventListener("click", e => { const b = e.target.closest(".chip"); if (b) { $("instruct").value = b.textContent; LS.set("instruct", b.textContent); } });
+$("genBtn").addEventListener("click", generate);
+document.addEventListener("keydown", e => { if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); generate(); } });
+
+onText();
+loadOptions();
+loadHistory();
+pollStatus();
+</script>
+</body>
+</html>

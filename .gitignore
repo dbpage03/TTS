@@ -12,6 +12,7 @@ venv/
 env/
 
 # Audio output
+outputs/
 *.wav
 *.mp3
 *.flac
