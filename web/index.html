@@ -191,6 +191,11 @@
   .rec.on .recdot { animation: pulse 1s infinite; border-radius: 2px; }
   .refprev { display: flex; align-items: center; gap: 12px; margin-top: 10px; flex-wrap: wrap; }
   .refprev audio { height: 36px; flex: 1; min-width: 220px; }
+  .tx-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; flex-wrap: wrap; }
+  .tx-btn { display: inline-flex; align-items: center; gap: 6px; color: var(--accent); border-color: var(--accent); font-weight: 600; }
+  .tx-btn:disabled { opacity: .5; cursor: not-allowed; }
+  .tx-btn .spin { width: 12px; height: 12px; border: 2px solid var(--accent-soft); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; display: none; }
+  .tx-btn.working .spin { display: inline-block; }
   .empty-voices { grid-column: 1 / -1; color: var(--muted); font-size: 14px; text-align: center; padding: 18px; }
 </style>
 </head>
@@ -307,8 +312,13 @@
           </div>
 
           <div style="margin-top:14px">
-            <label class="lbl" for="vfText"><span class="stepn">3 · </span>Transcript of the reference audio</label>
-            <textarea id="vfText" style="min-height:80px;font-size:14px" placeholder="Type exactly what is said in the clip. This gives the most faithful clone."></textarea>
+            <div class="tx-head">
+              <label class="lbl" for="vfText" style="margin:0"><span class="stepn">3 · </span>Transcript of the reference audio</label>
+              <button type="button" class="chip tx-btn" id="vfTranscribe" title="Transcribe the reference audio with Whisper (uses the Language setting below, or auto-detects)">
+                <span class="spin"></span><span id="vfTxLabel">✨ Transcribe with Whisper</span>
+              </button>
+            </div>
+            <textarea id="vfText" style="min-height:80px;font-size:14px" placeholder="Type exactly what is said in the clip, or let Whisper transcribe it. This gives the most faithful clone."></textarea>
             <label class="check"><input type="checkbox" id="vfXvec"> No transcript: quick clone from voice timbre only (less accurate)</label>
           </div>
 
@@ -676,10 +686,42 @@ async function useAudio(blob, label) {
     vf.b64 = b64; vf.fromClip = null;
     showRef(URL.createObjectURL(wav), duration, label);
     if (!$("vfName").value && blob.name) $("vfName").value = blob.name.replace(/\.[^.]+$/, "").slice(0, 60);
+    if (!$("vfText").value.trim() && !$("vfXvec").checked) transcribeRef(true);
   } catch (e) {
     $("vfErr").textContent = "Couldn't read that audio file. Try WAV, MP3, FLAC or OGG.";
   }
 }
+// Whisper transcription of the reference audio.
+let txBusy = false;
+async function transcribeRef(auto) {
+  const src = vf.b64 ? { audio_b64: vf.b64 } : vf.fromClip ? { from_clip: vf.fromClip } : vf.editId ? { voice_id: vf.editId } : null;
+  if (!src) { if (!auto) $("vfErr").textContent = "Add reference audio first."; return; }
+  if (txBusy) return;
+  txBusy = true; $("vfErr").textContent = "";
+  const btn = $("vfTranscribe"); btn.classList.add("working"); btn.disabled = true;
+  $("vfTxLabel").textContent = "Transcribing… (first use loads Whisper)";
+  const before = $("vfText").value;
+  try {
+    const res = await fetch("/api/transcribe", { method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...src, language: $("language").value }) });
+    const data = await res.json();
+    if (!res.ok) throw new Error(typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail));
+    if (!data.text) throw new Error("No speech was detected in the audio.");
+    // Don't clobber anything the user typed while an automatic run was in flight.
+    if (!auto || $("vfText").value === before) {
+      $("vfText").value = data.text;
+      if ($("vfXvec").checked) { $("vfXvec").checked = false; syncXvec(); }
+    }
+    toast(`Transcribed in ${data.seconds}s (${data.device}). Check it matches the audio exactly.`);
+  } catch (e) {
+    $("vfErr").textContent = "Transcription: " + e.message;
+  } finally {
+    txBusy = false; btn.classList.remove("working"); btn.disabled = false;
+    $("vfTxLabel").textContent = "✨ Transcribe with Whisper";
+  }
+}
+$("vfTranscribe").addEventListener("click", () => transcribeRef(false));
+
 $("refFile").addEventListener("change", e => { const f = e.target.files[0]; if (f) useAudio(f, f.name); e.target.value = ""; });
 const drop = $("drop");
 ["dragenter", "dragover"].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add("over"); }));

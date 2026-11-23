@@ -82,7 +82,13 @@ startup, or `--clone-model Qwen/Qwen3-TTS-12Hz-0.6B-Base` to save VRAM.
 1. Click **+ New voice**, then upload an audio file (WAV/MP3/FLAC/OGG, drag and drop works)
    or **Record** from your microphone. 5–20 s of clean speech from one speaker works best.
    You can also clone the voice of any clip in History with its copy icon.
-2. Name the voice and type **exactly what is said** in the sample. That gives a *Full*
+2. Name the voice and enter **exactly what is said** in the sample. When you add audio,
+   it's transcribed automatically with Whisper (`openai/whisper-large-v3-turbo`, downloaded
+   on first use, ~1.6 GB). Use **✨ Transcribe with Whisper** to re-run it, and check the
+   result against the audio. Whisper uses the GPU when there's spare VRAM, otherwise the CPU
+   (about 10 s for a 20 s clip). Options: `--whisper-model openai/whisper-small`,
+   `--whisper-device cpu|cuda:0`.
+   An exact transcript gives a *Full*
    clone (the model conditions on the audio + transcript). If you don't have a transcript,
    tick the no-transcript option for a *Quick* clone from the voice's timbre only. It's faster
    but sounds less like the original.

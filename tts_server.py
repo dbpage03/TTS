@@ -60,11 +60,17 @@ DEFAULT_CLONE_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
 MAX_REF_SECONDS = 60.0
 
 # Settings shared by both models (filled in from the CLI flags in main()).
+DEFAULT_WHISPER_MODEL = "openai/whisper-large-v3-turbo"
+
 CONFIG = {"device": "auto", "dtype": "bfloat16", "flash_attn": False,
-          "clone_model": DEFAULT_CLONE_MODEL}
+          "clone_model": DEFAULT_CLONE_MODEL,
+          "whisper_model": DEFAULT_WHISPER_MODEL, "whisper_device": "auto"}
 
 # Both models share one GPU, so only one generation runs at a time.
 GPU_LOCK = threading.Lock()
+# Model loading isn't thread-safe in transformers (concurrent from_pretrained
+# calls can leave weights on the "meta" device), so loads run one at a time.
+LOAD_LOCK = threading.Lock()
 
 
 # --------------------------------------------------------------------------- #
@@ -115,14 +121,15 @@ class ModelState:
         try:
             self.device = resolve_device(CONFIG["device"])
             print(f"Loading model {model_id} on {self.device} ({self.dtype})...")
-            t0 = time.perf_counter()
-            self.model = Qwen3TTSModel.from_pretrained(
-                model_id,
-                device_map=self.device,
-                dtype=DTYPE_MAP[self.dtype],
-                attn_implementation="flash_attention_2" if CONFIG["flash_attn"] else None,
-            )
-            self.load_seconds = time.perf_counter() - t0
+            with LOAD_LOCK:
+                t0 = time.perf_counter()
+                self.model = Qwen3TTSModel.from_pretrained(
+                    model_id,
+                    device_map=self.device,
+                    dtype=DTYPE_MAP[self.dtype],
+                    attn_implementation="flash_attention_2" if CONFIG["flash_attn"] else None,
+                )
+                self.load_seconds = time.perf_counter() - t0
             print(f"Model {model_id} loaded in {self.load_seconds:.1f}s.")
             if self._warmup_fn:
                 self.status = "warming"
@@ -435,6 +442,121 @@ class VoiceUpdate(BaseModel):
     x_vector_only: Optional[bool] = None
 
 
+def _load_audio(audio_b64: Optional[str] = None, from_clip: Optional[str] = None,
+                voice_id: Optional[str] = None) -> tuple[np.ndarray, int]:
+    """Read mono float32 audio from an upload, a history clip, or a saved voice."""
+    if voice_id:
+        path = _voice_dir(voice_id) / "ref.wav"
+    elif from_clip:
+        path = OUTPUT_DIR / f"{_check_id(from_clip)}.wav"
+        if not path.exists():
+            raise HTTPException(404, "Clip not found.")
+    elif audio_b64:
+        try:
+            raw = base64.b64decode(audio_b64.split(",", 1)[-1])
+            audio, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
+        except Exception as e:
+            raise HTTPException(400, f"Could not read audio ({e}). Upload a WAV, MP3, FLAC or OGG file.")
+        path = None
+    else:
+        raise HTTPException(400, "Provide reference audio.")
+    if path is not None:
+        audio, sr = sf.read(path, dtype="float32", always_2d=False)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    return audio, int(sr)
+
+
+# --------------------------------------------------------------------------- #
+# Whisper transcription (fills in the reference transcript for Full clones)
+# --------------------------------------------------------------------------- #
+class Transcriber:
+    """Lazily loads a Whisper ASR pipeline on first use.
+
+    Runs on the GPU when there's enough free VRAM next to the TTS models,
+    otherwise on the CPU (slower, but only short reference clips go through it).
+    """
+
+    def __init__(self) -> None:
+        self.pipe = None
+        self.device: Optional[str] = None
+        self.lock = threading.Lock()
+
+    def _load(self) -> None:
+        import torch
+        from transformers import pipeline
+
+        want = CONFIG["whisper_device"]
+        if want == "auto":
+            want = "cpu"
+            if torch.cuda.is_available():
+                free, _ = torch.cuda.mem_get_info()
+                # Leave room for any TTS model that hasn't loaded yet (~5 GB each).
+                pending = sum(s.status != "ready" for s in (STATE, CLONE))
+                if free > (2.5 + 5 * pending) * 1024**3:
+                    want = "cuda:0"
+        print(f"Loading Whisper {CONFIG['whisper_model']} on {want}...")
+        t0 = time.perf_counter()
+        with LOAD_LOCK:
+            self.pipe = pipeline(
+                "automatic-speech-recognition",
+                model=CONFIG["whisper_model"],
+                device=want,
+                torch_dtype=torch.float16 if want.startswith("cuda") else torch.float32,
+            )
+        self.device = want
+        print(f"Whisper loaded in {time.perf_counter() - t0:.1f}s.")
+
+    def transcribe(self, audio: np.ndarray, sr: int, language: Optional[str]) -> str:
+        import librosa
+
+        with self.lock:
+            if self.pipe is None:
+                self._load()
+        if sr != 16000:
+            audio = librosa.resample(audio, orig_sr=sr, target_sr=16000)
+        gen = {"task": "transcribe"}
+        if language and language != "Auto":
+            gen["language"] = language.lower()
+        # Share the GPU lock with TTS generation so they don't contend for VRAM.
+        lock = GPU_LOCK if self.device and self.device.startswith("cuda") else self.lock
+        # Clips over Whisper's 30 s window use its native long-form mode,
+        # which needs timestamps enabled.
+        extra = {"return_timestamps": True} if len(audio) > 30 * 16000 else {}
+        with lock:
+            out = self.pipe(
+                {"raw": audio.astype(np.float32), "sampling_rate": 16000},
+                generate_kwargs=gen,
+                **extra,
+            )
+        return (out.get("text") or "").strip()
+
+
+TRANSCRIBER = Transcriber()
+
+
+class TranscribeRequest(BaseModel):
+    audio_b64: Optional[str] = None
+    from_clip: Optional[str] = None
+    voice_id: Optional[str] = None
+    language: Optional[str] = None  # one of SUPPORTED_LANGUAGES; Auto = detect
+
+
+@app.post("/api/transcribe")
+def transcribe(req: TranscribeRequest):
+    audio, sr = _load_audio(req.audio_b64, req.from_clip, req.voice_id)
+    if len(audio) / sr > MAX_REF_SECONDS + 30:
+        raise HTTPException(400, "Audio is too long to transcribe here.")
+    t0 = time.perf_counter()
+    try:
+        text = TRANSCRIBER.transcribe(audio, sr, req.language)
+    except Exception as e:
+        raise HTTPException(500, f"Transcription failed: {type(e).__name__}: {e}")
+    secs = time.perf_counter() - t0
+    print(f"Transcribed {len(audio) / sr:.1f}s of audio in {secs:.1f}s on {TRANSCRIBER.device}.")
+    return {"text": text, "seconds": round(secs, 2), "device": TRANSCRIBER.device}
+
+
 def _voice_dir(voice_id: str) -> Path:
     d = VOICES_DIR / _check_id(voice_id)
     if not (d / "ref.wav").exists():
@@ -467,25 +589,11 @@ def create_voice(req: VoiceCreate):
     ref_text = (req.ref_text or "").strip() or None
     x_vec = req.x_vector_only or not ref_text  # no transcript -> embedding-only
 
-    if req.from_clip:
-        wav = OUTPUT_DIR / f"{_check_id(req.from_clip)}.wav"
-        if not wav.exists():
-            raise HTTPException(404, "Clip not found.")
-        audio, sr = sf.read(wav, dtype="float32", always_2d=False)
-        if ref_text is None:
-            ref_text = _read_json(wav.with_suffix(".json")).get("text")
-            x_vec = req.x_vector_only or not ref_text
-    elif req.audio_b64:
-        try:
-            raw = base64.b64decode(req.audio_b64.split(",", 1)[-1])
-            audio, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
-        except Exception as e:
-            raise HTTPException(400, f"Could not read audio ({e}). Upload a WAV, MP3, FLAC or OGG file.")
-    else:
-        raise HTTPException(400, "Provide reference audio.")
+    audio, sr = _load_audio(req.audio_b64, req.from_clip)
+    if req.from_clip and ref_text is None:
+        ref_text = _read_json(OUTPUT_DIR / f"{req.from_clip}.json").get("text")
+        x_vec = req.x_vector_only or not ref_text
 
-    if audio.ndim > 1:
-        audio = audio.mean(axis=1)
     if req.trim_silence and len(audio):
         import librosa
 
@@ -646,6 +754,11 @@ def main() -> None:
                    help="Voice-cloning (Base) model, e.g. Qwen/Qwen3-TTS-12Hz-0.6B-Base to save VRAM.")
     p.add_argument("--preload-clone", action="store_true",
                    help="Load the clone model at startup instead of on first use.")
+    p.add_argument("--whisper-model", default=DEFAULT_WHISPER_MODEL,
+                   help="Whisper model used to auto-transcribe reference audio "
+                        "(e.g. openai/whisper-small for less memory).")
+    p.add_argument("--whisper-device", default="auto",
+                   help="Device for Whisper: auto (GPU if >2.5 GB free, else CPU), cuda:0, or cpu.")
     p.add_argument("--device", default="auto")
     p.add_argument("--dtype", default="bfloat16", choices=sorted(DTYPE_MAP))
     p.add_argument("--flash-attn", "-f", action="store_true")
@@ -665,7 +778,8 @@ def main() -> None:
     torch.backends.cudnn.benchmark = True
 
     CONFIG.update(device=args.device, dtype=args.dtype, flash_attn=args.flash_attn,
-                  clone_model=args.clone_model)
+                  clone_model=args.clone_model, whisper_model=args.whisper_model,
+                  whisper_device=args.whisper_device)
     STATE.start_loading(args.model)
     if args.preload_clone:
         CLONE.start_loading(args.clone_model)
