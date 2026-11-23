@@ -2,31 +2,38 @@
 """Qwen3-TTS web server.
 
 A small FastAPI app that wraps the same model and options as ``tts_cli.py``
-behind a browser UI (``web/index.html``).
+behind a browser UI (``web/index.html``), plus a voice-cloning page backed by
+the Qwen3-TTS *Base* model.
 
 Usage:
     python tts_server.py                      # http://127.0.0.1:8000
     python tts_server.py --port 8080 --host 0.0.0.0
     python tts_server.py --dtype float16 --flash-attn
+    python tts_server.py --preload-clone      # load the clone model at startup too
 
-The model loads in the background at startup; the UI shows progress and
-enables the Generate button once it's ready. Generated clips are written to
-``outputs/`` and listed in the UI's history panel.
+Pages:
+    /        Preset voices (CustomVoice model, loads at startup)
+    /clone   Voice cloning (Base model, loads the first time the page is opened)
+
+Generated clips are written to ``outputs/``; cloned voices (reference audio +
+transcript) are stored in ``voices/``.
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import json
 import re
+import shutil
 import sys
 import threading
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import soundfile as sf
@@ -47,17 +54,28 @@ from tts_cli import (
 ROOT = Path(__file__).resolve().parent
 WEB_DIR = ROOT / "web"
 OUTPUT_DIR = ROOT / "outputs"
+VOICES_DIR = ROOT / "voices"
+
+DEFAULT_CLONE_MODEL = "Qwen/Qwen3-TTS-12Hz-1.7B-Base"
+MAX_REF_SECONDS = 60.0
+
+# Settings shared by both models (filled in from the CLI flags in main()).
+CONFIG = {"device": "auto", "dtype": "bfloat16", "flash_attn": False,
+          "clone_model": DEFAULT_CLONE_MODEL}
+
+# Both models share one GPU, so only one generation runs at a time.
+GPU_LOCK = threading.Lock()
 
 
 # --------------------------------------------------------------------------- #
 # Model state
 # --------------------------------------------------------------------------- #
 class ModelState:
-    """Holds the model plus its load status; synthesis is serialized by a lock."""
+    """Holds one model plus its load status and generation progress."""
 
-    def __init__(self) -> None:
+    def __init__(self, warmup: Optional[Callable] = None) -> None:
         self.model = None
-        self.status = "idle"  # idle | loading | ready | error
+        self.status = "idle"  # idle | loading | warming | ready | error
         self.error: Optional[str] = None
         self.device: Optional[str] = None
         self.model_id: Optional[str] = None
@@ -65,48 +83,71 @@ class ModelState:
         self.load_seconds: Optional[float] = None
         self.busy = False
         self.progress = {"done": 0, "total": 0}
-        self.lock = threading.Lock()
+        self._warmup_fn = warmup
+        self._load_lock = threading.Lock()
 
-    def load(self, model_id: str, device: str, dtype: str, flash_attn: bool) -> None:
+    def info(self) -> dict:
+        return {
+            "status": self.status,
+            "error": self.error,
+            "device": self.device,
+            "model": self.model_id,
+            "dtype": self.dtype,
+            "load_seconds": self.load_seconds,
+            "busy": self.busy,
+            "progress": self.progress,
+        }
+
+    def start_loading(self, model_id: str) -> None:
+        """Kick off a background load unless one is done or in flight."""
+        with self._load_lock:
+            if self.status in ("loading", "warming", "ready"):
+                return
+            self.status = "loading"
+            self.error = None
+        threading.Thread(target=self._load, args=(model_id,), daemon=True).start()
+
+    def _load(self, model_id: str) -> None:
         from qwen_tts import Qwen3TTSModel
 
-        self.status = "loading"
         self.model_id = model_id
-        self.dtype = dtype
+        self.dtype = CONFIG["dtype"]
         try:
-            self.device = resolve_device(device)
-            print(f"Loading model {model_id} on {self.device} ({dtype})...")
+            self.device = resolve_device(CONFIG["device"])
+            print(f"Loading model {model_id} on {self.device} ({self.dtype})...")
             t0 = time.perf_counter()
             self.model = Qwen3TTSModel.from_pretrained(
                 model_id,
                 device_map=self.device,
-                dtype=DTYPE_MAP[dtype],
-                attn_implementation="flash_attention_2" if flash_attn else None,
+                dtype=DTYPE_MAP[self.dtype],
+                attn_implementation="flash_attention_2" if CONFIG["flash_attn"] else None,
             )
             self.load_seconds = time.perf_counter() - t0
-            print(f"Model loaded in {self.load_seconds:.1f}s.")
-            self._warmup()
+            print(f"Model {model_id} loaded in {self.load_seconds:.1f}s.")
+            if self._warmup_fn:
+                self.status = "warming"
+                try:
+                    t0 = time.perf_counter()
+                    with GPU_LOCK:
+                        self._warmup_fn(self.model)
+                    print(f"Warm-up done in {time.perf_counter() - t0:.1f}s.")
+                except Exception as e:
+                    print(f"Warm-up skipped: {e}")
             self.status = "ready"
         except Exception as e:  # surface the failure in the UI
             self.status = "error"
             self.error = f"{type(e).__name__}: {e}"
             print(f"Model load failed: {self.error}")
 
-    def _warmup(self) -> None:
-        """Run one tiny generation so CUDA kernels / caches are hot before the
-        first real request (the first call is otherwise noticeably slower)."""
-        self.status = "warming"
-        try:
-            t0 = time.perf_counter()
-            self.model.generate_custom_voice(
-                text="Hi.", language="English", speaker="Ryan", max_new_tokens=64
-            )
-            print(f"Warm-up done in {time.perf_counter() - t0:.1f}s.")
-        except Exception as e:
-            print(f"Warm-up skipped: {e}")
+
+def _warm_custom(model) -> None:
+    # One tiny generation so CUDA kernels / caches are hot before the first
+    # real request (the first call is otherwise noticeably slower).
+    model.generate_custom_voice(text="Hi.", language="English", speaker="Ryan", max_new_tokens=64)
 
 
-STATE = ModelState()
+STATE = ModelState(warmup=_warm_custom)  # preset voices (CustomVoice)
+CLONE = ModelState()  # voice cloning (Base)
 
 
 # --------------------------------------------------------------------------- #
@@ -151,13 +192,11 @@ def split_text(text: str, max_chars: int) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
-# API
+# Shared generation helpers
 # --------------------------------------------------------------------------- #
-class SynthRequest(BaseModel):
+class GenOptions(BaseModel):
     text: str = Field(..., min_length=1, max_length=20000)
-    speaker: str = "Vivian"
     language: str = "Auto"
-    instruct: Optional[str] = None
     max_new_tokens: int = Field(4096, ge=64, le=32768)
     play_on_server: bool = False
     name: Optional[str] = None
@@ -173,78 +212,17 @@ class SynthRequest(BaseModel):
     seed: Optional[int] = Field(None, ge=0, le=2**32 - 1)
 
 
-app = FastAPI(title="Qwen3-TTS")
+class SynthRequest(GenOptions):
+    speaker: str = "Vivian"
+    instruct: Optional[str] = None
 
 
-def _canonical_speaker(name: str) -> str:
-    lowered = {k.lower(): k for k in SPEAKER_DESCRIPTIONS}
-    if name.lower() not in lowered:
-        raise HTTPException(400, f"Unknown speaker '{name}'.")
-    return lowered[name.lower()]
+class CloneSynthRequest(GenOptions):
+    voice_id: str
 
 
-def _safe_stem(text: str) -> str:
-    stem = re.sub(r"[^A-Za-z0-9 _-]+", "", text).strip().replace(" ", "_")
-    return stem[:40] or "clip"
-
-
-def _clip_info(wav: Path) -> dict:
-    meta_path = wav.with_suffix(".json")
-    meta = {}
-    if meta_path.exists():
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except Exception:
-            meta = {}
+def _sampling_kwargs(req: GenOptions) -> dict:
     return {
-        "id": wav.stem,
-        "url": f"/api/clips/{wav.stem}.wav",
-        "created": meta.get("created")
-        or datetime.fromtimestamp(wav.stat().st_mtime).isoformat(timespec="seconds"),
-        **{k: v for k, v in meta.items() if k != "created"},
-    }
-
-
-@app.get("/api/status")
-def status():
-    return {
-        "status": STATE.status,
-        "error": STATE.error,
-        "device": STATE.device,
-        "model": STATE.model_id,
-        "dtype": STATE.dtype,
-        "load_seconds": STATE.load_seconds,
-        "busy": STATE.busy,
-        "progress": STATE.progress,
-    }
-
-
-@app.get("/api/options")
-def options():
-    return {
-        "speakers": [
-            {"name": k, "description": v} for k, v in SPEAKER_DESCRIPTIONS.items()
-        ],
-        "languages": SUPPORTED_LANGUAGES,
-    }
-
-
-@app.post("/api/synthesize")
-def synthesize(req: SynthRequest):
-    # Plain `def` -> FastAPI runs it in a worker thread, so the event loop
-    # (and /api/status polling) stays responsive during generation.
-    if STATE.status != "ready":
-        raise HTTPException(503, f"Model is not ready (status: {STATE.status}).")
-    speaker = _canonical_speaker(req.speaker)
-    if req.language not in SUPPORTED_LANGUAGES:
-        raise HTTPException(400, f"Unsupported language '{req.language}'.")
-    text = req.text.strip()
-    if not text:
-        raise HTTPException(400, "Text is empty.")
-    instruct = (req.instruct or "").strip() or None
-
-    chunks = split_text(text, req.chunk_chars)
-    gen_kwargs = {
         k: v
         for k, v in {
             "temperature": req.temperature,
@@ -255,36 +233,59 @@ def synthesize(req: SynthRequest):
         if v is not None
     }
 
-    with STATE.lock:
-        STATE.busy = True
-        STATE.progress = {"done": 0, "total": len(chunks)}
-        try:
-            if req.seed is not None:
-                import torch
 
-                torch.manual_seed(req.seed)
-                if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(req.seed)
+def _seed(seed: Optional[int]) -> None:
+    if seed is None:
+        return
+    import torch
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def _validate_common(state: ModelState, req: GenOptions) -> str:
+    if state.status != "ready":
+        raise HTTPException(503, f"Model is not ready (status: {state.status}).")
+    if req.language not in SUPPORTED_LANGUAGES:
+        raise HTTPException(400, f"Unsupported language '{req.language}'.")
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(400, "Text is empty.")
+    return text
+
+
+def _generate_chunked(
+    state: ModelState,
+    req: GenOptions,
+    text: str,
+    generate: Callable[[list[str]], tuple[list, int]],
+    before: Optional[Callable[[], None]] = None,
+) -> tuple[np.ndarray, int, float, int]:
+    """Split ``text``, run ``generate`` over batches of chunks under the GPU
+    lock, and join the results. Returns (audio, sr, synth_seconds, n_chunks)."""
+    chunks = split_text(text, req.chunk_chars)
+    with GPU_LOCK:
+        state.busy = True
+        state.progress = {"done": 0, "total": len(chunks)}
+        try:
+            if before:
+                before()
+            _seed(req.seed)
             t0 = time.perf_counter()
             pieces: list[np.ndarray] = []
             sr = 24000
             for i in range(0, len(chunks), req.batch_size):
-                batch = chunks[i : i + req.batch_size]
-                wavs, sr = STATE.model.generate_custom_voice(
-                    text=batch,
-                    language=req.language,
-                    speaker=speaker,
-                    instruct=instruct,
-                    max_new_tokens=req.max_new_tokens,
-                    **gen_kwargs,
-                )
+                wavs, sr = generate(chunks[i : i + req.batch_size])
                 pieces.extend(np.asarray(w, dtype=np.float32).flatten() for w in wavs)
-                STATE.progress = {"done": len(pieces), "total": len(chunks)}
+                state.progress = {"done": len(pieces), "total": len(chunks)}
             synth_s = time.perf_counter() - t0
+        except HTTPException:
+            raise
         except Exception as e:
             raise HTTPException(500, f"{type(e).__name__}: {e}")
         finally:
-            STATE.busy = False
+            state.busy = False
 
     if len(pieces) > 1 and req.pause_ms:
         gap = np.zeros(int(sr * req.pause_ms / 1000), dtype=np.float32)
@@ -295,8 +296,12 @@ def synthesize(req: SynthRequest):
             joined.append(p)
         pieces = joined
     audio = np.concatenate(pieces) if pieces else np.zeros(0, dtype=np.float32)
-    duration = len(audio) / sr if sr else 0.0
+    return audio, sr, synth_s, len(chunks)
 
+
+def _save_clip(req: GenOptions, text: str, audio: np.ndarray, sr: int, synth_s: float,
+               n_chunks: int, extra: dict) -> dict:
+    duration = len(audio) / sr if sr else 0.0
     OUTPUT_DIR.mkdir(exist_ok=True)
     stem_src = (req.name or "").strip() or text
     clip_id = f"{datetime.now():%Y%m%d-%H%M%S}_{_safe_stem(stem_src)}_{uuid.uuid4().hex[:4]}"
@@ -305,13 +310,12 @@ def synthesize(req: SynthRequest):
     meta = {
         "created": datetime.now().isoformat(timespec="seconds"),
         "text": text,
-        "speaker": speaker,
         "language": req.language,
-        "instruct": instruct,
+        **extra,
         "duration": round(duration, 2),
         "synth_seconds": round(synth_s, 2),
         "sample_rate": sr,
-        "chunks": len(chunks),
+        "chunks": n_chunks,
         "seed": req.seed,
     }
     wav_path.with_suffix(".json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -328,6 +332,259 @@ def synthesize(req: SynthRequest):
     return _clip_info(wav_path)
 
 
+def _safe_stem(text: str) -> str:
+    stem = re.sub(r"[^A-Za-z0-9 _-]+", "", text).strip().replace(" ", "_")
+    return stem[:40] or "clip"
+
+
+def _check_id(value: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9_-]+", value):
+        raise HTTPException(400, "Bad id.")
+    return value
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _clip_info(wav: Path) -> dict:
+    meta = _read_json(wav.with_suffix(".json"))
+    return {
+        "id": wav.stem,
+        "url": f"/api/clips/{wav.stem}.wav",
+        "created": meta.get("created")
+        or datetime.fromtimestamp(wav.stat().st_mtime).isoformat(timespec="seconds"),
+        **{k: v for k, v in meta.items() if k != "created"},
+    }
+
+
+# --------------------------------------------------------------------------- #
+# App + preset-voice API
+# --------------------------------------------------------------------------- #
+app = FastAPI(title="Qwen3-TTS")
+
+
+def _canonical_speaker(name: str) -> str:
+    lowered = {k.lower(): k for k in SPEAKER_DESCRIPTIONS}
+    if name.lower() not in lowered:
+        raise HTTPException(400, f"Unknown speaker '{name}'.")
+    return lowered[name.lower()]
+
+
+@app.get("/api/status")
+def status():
+    # Top level = preset-voice model (kept for compatibility); `clone` = Base model.
+    return {**STATE.info(), "clone": CLONE.info()}
+
+
+@app.get("/api/options")
+def options():
+    return {
+        "speakers": [
+            {"name": k, "description": v} for k, v in SPEAKER_DESCRIPTIONS.items()
+        ],
+        "languages": SUPPORTED_LANGUAGES,
+    }
+
+
+@app.post("/api/synthesize")
+def synthesize(req: SynthRequest):
+    # Plain `def` -> FastAPI runs it in a worker thread, so the event loop
+    # (and /api/status polling) stays responsive during generation.
+    text = _validate_common(STATE, req)
+    speaker = _canonical_speaker(req.speaker)
+    instruct = (req.instruct or "").strip() or None
+    kwargs = _sampling_kwargs(req)
+
+    def gen(batch: list[str]):
+        return STATE.model.generate_custom_voice(
+            text=batch, language=req.language, speaker=speaker, instruct=instruct,
+            max_new_tokens=req.max_new_tokens, **kwargs,
+        )
+
+    audio, sr, synth_s, n = _generate_chunked(STATE, req, text, gen)
+    return _save_clip(req, text, audio, sr, synth_s, n,
+                      {"mode": "preset", "speaker": speaker, "instruct": instruct})
+
+
+# --------------------------------------------------------------------------- #
+# Voice cloning API
+# --------------------------------------------------------------------------- #
+# Prompt items (reference codes + speaker embedding) are built once per voice
+# and cached, so repeat generations skip re-encoding the reference audio.
+_PROMPT_CACHE: dict[str, list] = {}
+
+
+class VoiceCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=60)
+    ref_text: Optional[str] = Field(None, max_length=5000)
+    x_vector_only: bool = False
+    # Either a base64-encoded audio file (the UI sends 24 kHz mono WAV) ...
+    audio_b64: Optional[str] = None
+    # ... or the id of an existing generated clip to clone from.
+    from_clip: Optional[str] = None
+    trim_silence: bool = True
+
+
+class VoiceUpdate(BaseModel):
+    name: Optional[str] = Field(None, min_length=1, max_length=60)
+    ref_text: Optional[str] = Field(None, max_length=5000)
+    x_vector_only: Optional[bool] = None
+
+
+def _voice_dir(voice_id: str) -> Path:
+    d = VOICES_DIR / _check_id(voice_id)
+    if not (d / "ref.wav").exists():
+        raise HTTPException(404, "Voice not found.")
+    return d
+
+
+def _voice_info(d: Path) -> dict:
+    meta = _read_json(d / "meta.json")
+    return {"id": d.name, "ref_url": f"/api/voices/{d.name}/ref.wav", **meta}
+
+
+@app.post("/api/clone/load")
+def clone_load():
+    CLONE.start_loading(CONFIG["clone_model"])
+    return CLONE.info()
+
+
+@app.get("/api/voices")
+def list_voices():
+    if not VOICES_DIR.exists():
+        return []
+    dirs = [d for d in VOICES_DIR.iterdir() if (d / "ref.wav").exists()]
+    dirs.sort(key=lambda d: (d / "ref.wav").stat().st_mtime, reverse=True)
+    return [_voice_info(d) for d in dirs]
+
+
+@app.post("/api/voices")
+def create_voice(req: VoiceCreate):
+    ref_text = (req.ref_text or "").strip() or None
+    x_vec = req.x_vector_only or not ref_text  # no transcript -> embedding-only
+
+    if req.from_clip:
+        wav = OUTPUT_DIR / f"{_check_id(req.from_clip)}.wav"
+        if not wav.exists():
+            raise HTTPException(404, "Clip not found.")
+        audio, sr = sf.read(wav, dtype="float32", always_2d=False)
+        if ref_text is None:
+            ref_text = _read_json(wav.with_suffix(".json")).get("text")
+            x_vec = req.x_vector_only or not ref_text
+    elif req.audio_b64:
+        try:
+            raw = base64.b64decode(req.audio_b64.split(",", 1)[-1])
+            audio, sr = sf.read(io.BytesIO(raw), dtype="float32", always_2d=False)
+        except Exception as e:
+            raise HTTPException(400, f"Could not read audio ({e}). Upload a WAV, MP3, FLAC or OGG file.")
+    else:
+        raise HTTPException(400, "Provide reference audio.")
+
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    if req.trim_silence and len(audio):
+        import librosa
+
+        audio, _ = librosa.effects.trim(audio, top_db=40)
+    duration = len(audio) / sr
+    if duration < 1.0:
+        raise HTTPException(400, "Reference audio is too short (need at least ~1 second of speech).")
+    if duration > MAX_REF_SECONDS:
+        raise HTTPException(400, f"Reference audio is {duration:.0f}s; keep it under {MAX_REF_SECONDS:.0f}s (5-20s works best).")
+    peak = float(np.max(np.abs(audio))) or 1.0
+    if peak > 0.99 or peak < 0.3:  # normalise very quiet / clipping input
+        audio = audio * (0.9 / peak)
+
+    VOICES_DIR.mkdir(exist_ok=True)
+    voice_id = f"{_safe_stem(req.name)}_{uuid.uuid4().hex[:6]}"
+    d = VOICES_DIR / voice_id
+    d.mkdir()
+    sf.write(d / "ref.wav", audio.astype(np.float32), sr)
+    meta = {
+        "name": req.name.strip(),
+        "ref_text": ref_text,
+        "x_vector_only": bool(x_vec),
+        "duration": round(duration, 2),
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "source": f"clip:{req.from_clip}" if req.from_clip else "upload",
+    }
+    (d / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    return _voice_info(d)
+
+
+@app.patch("/api/voices/{voice_id}")
+def update_voice(voice_id: str, req: VoiceUpdate):
+    d = _voice_dir(voice_id)
+    meta = _read_json(d / "meta.json")
+    if req.name is not None:
+        meta["name"] = req.name.strip()
+    if req.ref_text is not None:
+        meta["ref_text"] = req.ref_text.strip() or None
+    if req.x_vector_only is not None:
+        meta["x_vector_only"] = req.x_vector_only
+    if not meta.get("ref_text"):
+        meta["x_vector_only"] = True
+    (d / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+    _PROMPT_CACHE.pop(voice_id, None)
+    return _voice_info(d)
+
+
+@app.get("/api/voices/{voice_id}/ref.wav")
+def voice_ref(voice_id: str):
+    return FileResponse(_voice_dir(voice_id) / "ref.wav", media_type="audio/wav")
+
+
+@app.delete("/api/voices/{voice_id}")
+def delete_voice(voice_id: str):
+    d = _voice_dir(voice_id)
+    shutil.rmtree(d)
+    _PROMPT_CACHE.pop(voice_id, None)
+    return {"deleted": voice_id}
+
+
+@app.post("/api/clone/synthesize")
+def clone_synthesize(req: CloneSynthRequest):
+    text = _validate_common(CLONE, req)
+    d = _voice_dir(req.voice_id)
+    meta = _read_json(d / "meta.json")
+    x_vec = bool(meta.get("x_vector_only")) or not meta.get("ref_text")
+    kwargs = _sampling_kwargs(req)
+    prompt: list = []
+
+    def build_prompt():
+        # Runs under the GPU lock: encode the reference once and cache it.
+        if req.voice_id not in _PROMPT_CACHE:
+            t0 = time.perf_counter()
+            _PROMPT_CACHE[req.voice_id] = CLONE.model.create_voice_clone_prompt(
+                ref_audio=str(d / "ref.wav"),
+                ref_text=None if x_vec else meta["ref_text"],
+                x_vector_only_mode=x_vec,
+            )
+            print(f"Built voice prompt for '{meta.get('name')}' in {time.perf_counter() - t0:.2f}s.")
+        prompt[:] = _PROMPT_CACHE[req.voice_id]
+
+    def gen(batch: list[str]):
+        return CLONE.model.generate_voice_clone(
+            text=batch, language=req.language, voice_clone_prompt=list(prompt),
+            max_new_tokens=req.max_new_tokens, **kwargs,
+        )
+
+    audio, sr, synth_s, n = _generate_chunked(CLONE, req, text, gen, before=build_prompt)
+    return _save_clip(req, text, audio, sr, synth_s, n, {
+        "mode": "clone",
+        "speaker": meta.get("name", req.voice_id),
+        "voice_id": req.voice_id,
+        "clone_mode": "x-vector" if x_vec else "icl",
+    })
+
+
+# --------------------------------------------------------------------------- #
+# Clips + pages
+# --------------------------------------------------------------------------- #
 @app.get("/api/clips")
 def list_clips():
     if not OUTPUT_DIR.exists():
@@ -337,9 +594,7 @@ def list_clips():
 
 
 def _clip_path(clip_id: str) -> Path:
-    if not re.fullmatch(r"[A-Za-z0-9_-]+", clip_id):
-        raise HTTPException(400, "Bad clip id.")
-    path = OUTPUT_DIR / f"{clip_id}.wav"
+    path = OUTPUT_DIR / f"{_check_id(clip_id)}.wav"
     if not path.exists():
         raise HTTPException(404, "Clip not found.")
     return path
@@ -362,7 +617,9 @@ def delete_clip(clip_id: str):
 
 
 @app.get("/")
+@app.get("/clone")
 def index():
+    # One page app; the path picks the active tab.
     return FileResponse(WEB_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
 
@@ -384,7 +641,11 @@ def main() -> None:
     p = argparse.ArgumentParser(description="Qwen3-TTS web server.")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8000)
-    p.add_argument("--model", default=DEFAULT_MODEL)
+    p.add_argument("--model", default=DEFAULT_MODEL, help="Preset-voice (CustomVoice) model.")
+    p.add_argument("--clone-model", default=DEFAULT_CLONE_MODEL,
+                   help="Voice-cloning (Base) model, e.g. Qwen/Qwen3-TTS-12Hz-0.6B-Base to save VRAM.")
+    p.add_argument("--preload-clone", action="store_true",
+                   help="Load the clone model at startup instead of on first use.")
     p.add_argument("--device", default="auto")
     p.add_argument("--dtype", default="bfloat16", choices=sorted(DTYPE_MAP))
     p.add_argument("--flash-attn", "-f", action="store_true")
@@ -403,13 +664,13 @@ def main() -> None:
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
-    threading.Thread(
-        target=STATE.load,
-        args=(args.model, args.device, args.dtype, args.flash_attn),
-        daemon=True,
-    ).start()
+    CONFIG.update(device=args.device, dtype=args.dtype, flash_attn=args.flash_attn,
+                  clone_model=args.clone_model)
+    STATE.start_loading(args.model)
+    if args.preload_clone:
+        CLONE.start_loading(args.clone_model)
 
-    print(f"UI: http://{args.host}:{args.port}")
+    print(f"UI: http://{args.host}:{args.port}  (voice cloning: /clone)")
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 
 

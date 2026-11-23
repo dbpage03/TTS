@@ -13,6 +13,7 @@ env/
 
 # Audio output
 outputs/
+voices/
 *.wav
 *.mp3
 *.flac

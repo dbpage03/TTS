@@ -72,6 +72,27 @@ python tts_server.py --host 0.0.0.0 --port 8080 --dtype float16 --flash-attn
 - Sampling controls (temperature, top-p, repetition penalty) and a seed for reproducible takes.
 - The model loads and warms up in the background at startup; the header shows its status.
 
+### Voice cloning (`/clone`)
+
+The **Voice cloning** tab clones any voice from a short sample using the
+`Qwen/Qwen3-TTS-12Hz-1.7B-Base` model. It loads the first time you open the tab
+(the first time ever, it downloads ~4 GB). Use `--preload-clone` to load it at
+startup, or `--clone-model Qwen/Qwen3-TTS-12Hz-0.6B-Base` to save VRAM.
+
+1. Click **+ New voice**, then upload an audio file (WAV/MP3/FLAC/OGG, drag and drop works)
+   or **Record** from your microphone. 5–20 s of clean speech from one speaker works best.
+   You can also clone the voice of any clip in History with its copy icon.
+2. Name the voice and type **exactly what is said** in the sample. That gives a *Full*
+   clone (the model conditions on the audio + transcript). If you don't have a transcript,
+   tick the no-transcript option for a *Quick* clone from the voice's timbre only. It's faster
+   but sounds less like the original.
+3. Select the voice, type your text, and generate. The same speed and sampling settings
+   apply. In Full mode each chunk carries the reference clip, so very small chunk sizes slow
+   it down. Keep chunk size around 200+ characters.
+
+Voices are saved in `voices/` (reference WAV + metadata) and can be renamed, re-transcribed,
+or deleted from their cards. Only clone voices you have permission to use.
+
 ## Options
 
 | Flag | Default | Description |
